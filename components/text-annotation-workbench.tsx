@@ -19,10 +19,12 @@ import {
 } from '@heroui/react';
 import {
   AlertTriangle,
+  ArrowRightLeft,
   BookOpen,
   Check,
   ChevronRight,
   CircleHelp,
+  Combine,
   FileDown,
   FileJson,
   GitCompareArrows,
@@ -34,6 +36,7 @@ import {
   Printer,
   Redo2,
   Save,
+  Scissors,
   Search,
   Trash2,
   Undo2,
@@ -41,18 +44,21 @@ import {
   WifiOff
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
+import { annotationKindLabels, anchorTypeLabels, initialDocument, newSentenceId, newTokenId, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
   clone,
   collectSearchResults,
   createInitialEditorState,
   editorReducer,
+  getAnchorLabelFromChapters,
   getConflictGroups,
   getSentence,
   getTargetLabel,
   kindLabel,
+  mergeSentences,
   removeAnnotationReferences,
+  splitSentenceAt,
   updateSentenceText
 } from '@/lib/editor';
 import type {
@@ -99,34 +105,82 @@ function escapeHtml(value: string) {
 }
 
 function buildHtml(document: TextDocument) {
+  // 按“章节 → 句子 → 句内词序 → 句子本身 → 章节本身”给所有注释统一编号，
+  // 句序和词序都是拆分/合并后的最新结构，因此编号落位反映迁移后的目标。
+  const order = new Map<string, number>();
+  let sequence = 0;
+  const register = (id: string) => {
+    if (!order.has(id)) order.set(id, ++sequence);
+  };
+
   const sections = document.chapters
     .map((chapter) => {
       const sentences = chapter.sentences
         .map((sentence) => {
-          const notes = document.annotations.filter(
-            (annotation) => annotation.anchorId === sentence.id && annotation.anchorType === 'sentence'
-          );
-          const suffix = notes
-            .map((annotation) => `<sup title="${escapeHtml(annotation.title)}">[${escapeHtml(annotation.source)}]</sup>`)
+          const tokenHtml = sentence.tokens
+            .map((token) => {
+              const wordNotes = document.annotations.filter(
+                (annotation) => annotation.anchorType === 'word' && annotation.anchorId === token.id
+              );
+              if (!wordNotes.length) return escapeHtml(token.text);
+              const marks = wordNotes
+                .map((annotation) => {
+                  register(annotation.id);
+                  return `<sup title="${escapeHtml(annotation.title)}">[${order.get(annotation.id)}·${escapeHtml(annotation.source)}]</sup>`;
+                })
+                .join('');
+              return `<span class="word">${escapeHtml(token.text)}${marks}</span>`;
+            })
             .join('');
-          return `<p id="${escapeHtml(sentence.id)}">${escapeHtml(sentence.text)}${suffix}</p>`;
+          const sentenceNotes = document.annotations.filter(
+            (annotation) => annotation.anchorType === 'sentence' && annotation.anchorId === sentence.id
+          );
+          const suffix = sentenceNotes
+            .map((annotation) => {
+              register(annotation.id);
+              return `<sup title="${escapeHtml(annotation.title)}">[${order.get(annotation.id)}·${escapeHtml(annotation.source)}]</sup>`;
+            })
+            .join('');
+          return `<p id="${escapeHtml(sentence.id)}">${tokenHtml}${suffix}</p>`;
         })
         .join('\n');
-      return `<section><h2>${escapeHtml(chapter.title)}</h2><p class="summary">${escapeHtml(chapter.summary)}</p>${sentences}</section>`;
+
+      const chapterNotes = document.annotations.filter(
+        (annotation) => annotation.anchorType === 'chapter' && annotation.anchorId === chapter.id
+      );
+      const chapterSuffix = chapterNotes
+        .map((annotation) => {
+          register(annotation.id);
+          return `<sup title="${escapeHtml(annotation.title)}">[${order.get(annotation.id)}·${escapeHtml(annotation.source)}]</sup>`;
+        })
+        .join('');
+
+      return `<section><h2>${escapeHtml(chapter.title)}${chapterSuffix}</h2><p class="summary">${escapeHtml(chapter.summary)}</p>${sentences}</section>`;
     })
     .join('\n');
 
   const notes = document.annotations
-    .map(
-      (annotation) =>
-        `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br>${escapeHtml(annotation.body)}</li>`
-    )
+    .slice()
+    .sort((a, b) => (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+    .map((annotation) => {
+      const target =
+        getAnchorLabelFromChapters(
+          document.chapters,
+          annotation.anchorId,
+          annotation.anchorType
+        ) ?? '已迁移目标';
+      const index = order.get(annotation.id);
+      const migration = annotation.migrationNote
+        ? `<br><small class="migration">迁移说明：${escapeHtml(annotation.migrationNote)}</small>`
+        : '';
+      return `<li${index ? ` id="note-${index}"` : ''}><b>${index ? `[${index}] ` : ''}${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br><small class="target">目标：${escapeHtml(target)}</small><br>${escapeHtml(annotation.body)}${migration}</li>`;
+    })
     .join('\n');
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
-<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
+<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}.word{border-bottom:1px dotted #c2700a}sup{color:#b45309;font-weight:600}li{margin:.8em 0}small{color:#777}.target{color:#5b6f8a}.migration{color:#b45309}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
-${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
+${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}；注释编号按拆分/合并后的正文目标排定。</small></p></body></html>`;
 }
 
 function sentenceAnnotationCount(document: TextDocument, sentence: Sentence) {
@@ -307,20 +361,28 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
             </div>
           </div>
         ) : (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
-            <span>{getTargetLabel(document, annotation)}</span>
-            {annotation.references.length ? (
-              <span className="flex items-center gap-1"><Link2 className="h-3 w-3" />引用 {annotation.references.length} 条</span>
+          <>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
+              <span>{getTargetLabel(document, annotation)}</span>
+              {annotation.references.length ? (
+                <span className="flex items-center gap-1"><Link2 className="h-3 w-3" />引用 {annotation.references.length} 条</span>
+              ) : null}
+              <span className="ml-auto flex gap-1">
+                <Button isIconOnly size="sm" variant="light" aria-label="编辑注释" onPress={() => setEditing(true)}>
+                  <Pencil className="h-3.5 w-3.5" />
+                </Button>
+                <Button isIconOnly size="sm" variant="light" color="danger" aria-label="删除注释" onPress={onDelete}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </span>
+            </div>
+            {annotation.migrationNote ? (
+              <p className="flex items-start gap-1 rounded-md bg-amber-50 px-2 py-1 text-[11px] leading-4 text-amber-800">
+                <ArrowRightLeft className="mt-0.5 h-3 w-3 shrink-0" />
+                <span>{annotation.migrationNote}</span>
+              </p>
             ) : null}
-            <span className="ml-auto flex gap-1">
-              <Button isIconOnly size="sm" variant="light" aria-label="编辑注释" onPress={() => setEditing(true)}>
-                <Pencil className="h-3.5 w-3.5" />
-              </Button>
-              <Button isIconOnly size="sm" variant="light" color="danger" aria-label="删除注释" onPress={onDelete}>
-                <Trash2 className="h-3.5 w-3.5" />
-              </Button>
-            </span>
-          </div>
+          </>
         )}
       </CardBody>
     </Card>
@@ -336,6 +398,9 @@ export function TextAnnotationWorkbench() {
   const [pendingAnchor, setPendingAnchor] = useState<{ id: string; type: AnchorType; preview: string } | null>(null);
   const [editingSentenceDraft, setEditingSentenceDraft] = useState('');
   const [editingSentenceId, setEditingSentenceId] = useState<string | null>(null);
+  const [splittingSentenceId, setSplittingSentenceId] = useState<string | null>(null);
+  const [splitPreview, setSplitPreview] = useState<{ front: string; back: string } | null>(null);
+  const splitTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [leftVersionId, setLeftVersionId] = useState('snapshot-base');
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
@@ -401,7 +466,7 @@ export function TextAnnotationWorkbench() {
       type: selectedSentence ? 'sentence' : 'chapter',
       preview: selectedSentence?.text ?? selectedChapter?.title ?? ''
     });
-  }, [selectedChapter?.id, selectedSentence?.id]);
+  }, [selectedChapter?.id, selectedSentence?.id, selectedSentence?.text]);
 
   const moveToNextAnnotation = useCallback(() => {
     if (!document.annotations.length) return;
@@ -547,6 +612,65 @@ export function TextAnnotationWorkbench() {
     if (remapped) setApiMessage(`已修订句子；${remapped} 条词级引用自动迁移到所属句`);
   }
 
+  function startSplitSentence(sentence: Sentence) {
+    setEditingSentenceId(null);
+    setSplitPreview({
+      front: sentence.text.slice(0, Math.floor(sentence.text.length / 2)),
+      back: sentence.text.slice(Math.floor(sentence.text.length / 2))
+    });
+    setSplittingSentenceId(sentence.id);
+  }
+
+  function applySentenceSplit() {
+    const sentence = selectedChapter?.sentences.find((item) => item.id === splittingSentenceId);
+    const textarea = splitTextareaRef.current;
+    if (!sentence || !selectedChapter) return;
+    // 光标位置即切分点；没有有效光标时退到句子正中。
+    const caret = textarea?.selectionStart;
+    let offset =
+      typeof caret === 'number' && caret > 0 && caret < sentence.text.length
+        ? caret
+        : Math.floor(sentence.text.length / 2);
+    const backId = newSentenceId();
+    const outcome: { value: { frontWordNotes: number; backWordNotes: number; sentenceNotes: number } | null } = {
+      value: null
+    };
+    dispatch({
+      type: 'commit',
+      label: '按光标位置拆句并迁移注释',
+      mutate: (doc) => {
+        outcome.value = splitSentenceAt(doc, sentence.id, offset, backId, newTokenId);
+      }
+    });
+    setSplittingSentenceId(null);
+    if (outcome.value) {
+      dispatch({ type: 'selectSentence', chapterId: selectedChapter.id, sentenceId: backId });
+      setApiMessage(
+        `已在光标处拆为两句：句注 ${outcome.value.sentenceNotes} 条留前句；词注前句 ${outcome.value.frontWordNotes} 条、后句 ${outcome.value.backWordNotes} 条`
+      );
+    }
+  }
+
+  function mergeWithNextSentence(sentence: Sentence) {
+    if (!selectedChapter) return;
+    const index = selectedChapter.sentences.findIndex((item) => item.id === sentence.id);
+    const next = selectedChapter.sentences[index + 1];
+    if (!next) return;
+    if (!window.confirm(`将「${sentence.text}」与下一句「${next.text}」合并？词注保持指向原词，两句的句注迁入新句并注明来源。`)) return;
+    const mergedId = newSentenceId();
+    let migrated = 0;
+    dispatch({
+      type: 'commit',
+      label: '合并相邻句并迁移句注',
+      mutate: (doc) => {
+        const outcome = mergeSentences(doc, selectedChapter.id, sentence.id, mergedId);
+        migrated = outcome?.migratedSentenceNotes ?? 0;
+      }
+    });
+    dispatch({ type: 'selectSentence', chapterId: selectedChapter.id, sentenceId: mergedId });
+    setApiMessage(`已合并两句；${migrated} 条句注迁入新句并注明来自原哪句，词注仍指向原词。`);
+  }
+
   function saveVersion() {
     const label = snapshotLabel.trim() || `校订快照 ${document.snapshots.length + 1}`;
     const id = `snapshot-${Date.now().toString(36)}`;
@@ -579,6 +703,18 @@ export function TextAnnotationWorkbench() {
         doc.annotations = clone(version.annotations);
       }
     });
+    // 恢复后当前选中句可能已不存在（拆/合句改过 id），回落到该章首句。
+    const chapter =
+      version.chapters.find((item) => item.id === workspace.selectedChapterId) ?? version.chapters[0];
+    const restoredSentence =
+      chapter?.sentences.find((item) => item.id === workspace.selectedSentenceId) ?? chapter?.sentences[0];
+    if (chapter) {
+      dispatch({
+        type: 'selectSentence',
+        chapterId: chapter.id,
+        sentenceId: restoredSentence?.id ?? ''
+      });
+    }
   }
 
   const comparison = useMemo(() => {
@@ -593,6 +729,7 @@ export function TextAnnotationWorkbench() {
     const leftSentences = new Map(
       left.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => [sentence.id, { chapter, sentence }] as const))
     );
+    const rightSentenceIds = new Set(right.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => sentence.id)));
     for (const chapter of right.chapters) {
       for (const sentence of chapter.sentences) {
         const previous = leftSentences.get(sentence.id);
@@ -607,10 +744,36 @@ export function TextAnnotationWorkbench() {
         }
       }
     }
-    const leftAnnotationIds = new Set(left.annotations.map((item) => item.id));
+    // 拆句会新建后句（上一节已报“新增句”）；合句会让原两句消失，单独标出。
+    for (const [sentenceId, entry] of leftSentences) {
+      if (!rightSentenceIds.has(sentenceId)) {
+        changes.push({
+          id: sentenceId,
+          label: `${entry.chapter.title} · 原第 ${entry.sentence.order} 句已拆分或合并`,
+          detail: entry.sentence.text
+        });
+      }
+    }
+
+    const leftAnnotationById = new Map(left.annotations.map((item) => [item.id, item]));
     for (const annotation of right.annotations) {
-      if (!leftAnnotationIds.has(annotation.id)) {
+      const previous = leftAnnotationById.get(annotation.id);
+      if (!previous) {
         changes.push({ id: annotation.id, label: `新增注释 · ${annotation.title}`, detail: annotation.body });
+        continue;
+      }
+      if (previous.anchorId !== annotation.anchorId || previous.anchorType !== annotation.anchorType) {
+        const from =
+          getAnchorLabelFromChapters(left.chapters, previous.anchorId, previous.anchorType) ?? '原目标';
+        const to =
+          getAnchorLabelFromChapters(right.chapters, annotation.anchorId, annotation.anchorType) ??
+          annotation.migrationNote ??
+          '迁移后目标';
+        changes.push({
+          id: annotation.id,
+          label: `注释目标已迁移 · ${annotation.title}`,
+          detail: `${from} → ${to}${annotation.migrationNote ? `（${annotation.migrationNote}）` : ''}`
+        });
       }
     }
     return { left, right, changes };
@@ -801,13 +964,14 @@ export function TextAnnotationWorkbench() {
             <Divider />
             <CardBody className="px-5 py-7 sm:px-9">
               <div className="mx-auto max-w-4xl space-y-5">
-                {selectedChapter?.sentences.map((sentence) => {
+                {selectedChapter?.sentences.map((sentence, sentenceIndex) => {
                   const sentenceAnnotations = document.annotations.filter(
                     (annotation) =>
                       annotation.anchorId === sentence.id ||
                       sentence.tokens.some((token) => token.id === annotation.anchorId)
                   );
                   const active = selectedSentence?.id === sentence.id;
+                  const isLastSentence = sentenceIndex === selectedChapter.sentences.length - 1;
                   return (
                     <article
                       key={sentence.id}
@@ -834,6 +998,47 @@ export function TextAnnotationWorkbench() {
                               <div className="flex gap-2">
                                 <Button size="sm" color="primary" onPress={applySentenceEdit}>保存修订</Button>
                                 <Button size="sm" variant="light" onPress={() => setEditingSentenceId(null)}>取消</Button>
+                              </div>
+                            </div>
+                          ) : splittingSentenceId === sentence.id ? (
+                            <div className="space-y-3">
+                              <Textarea
+                                aria-label="把光标放到要拆开的位置"
+                                ref={splitTextareaRef}
+                                value={sentence.text}
+                                minRows={2}
+                                readOnly
+                                autoFocus
+                                onFocus={(event) => {
+                                  // 打开后默认把光标放在句中，用户再点击调整。
+                                  event.target.setSelectionRange(
+                                    Math.floor(sentence.text.length / 2),
+                                    Math.floor(sentence.text.length / 2)
+                                  );
+                                }}
+                                onClick={(event) => {
+                                  const offset = event.currentTarget.selectionStart;
+                                  if (typeof offset !== 'number' || offset <= 0 || offset >= sentence.text.length) return;
+                                  const front = sentence.text.slice(0, offset);
+                                  const back = sentence.text.slice(offset);
+                                  setSplitPreview({ front, back });
+                                }}
+                                onKeyUp={(event) => {
+                                  const offset = event.currentTarget.selectionStart;
+                                  if (typeof offset !== 'number' || offset <= 0 || offset >= sentence.text.length) return;
+                                  setSplitPreview({ front: sentence.text.slice(0, offset), back: sentence.text.slice(offset) });
+                                }}
+                              />
+                              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                                光标处将拆为：<br />
+                                前句（含原句起点，保留句注）：{splitPreview?.front ?? sentence.text.slice(0, Math.floor(sentence.text.length / 2))}<br />
+                                后句（后半段词注随原词跟入）：{splitPreview?.back ?? sentence.text.slice(Math.floor(sentence.text.length / 2))}
+                              </div>
+                              <div className="flex gap-2">
+                                <Button size="sm" color="primary" startContent={<Scissors className="h-3.5 w-3.5" />} onPress={applySentenceSplit}>
+                                  在光标处拆为两句
+                                </Button>
+                                <Button size="sm" variant="light" onPress={() => { setSplittingSentenceId(null); setSplitPreview(null); }}>取消</Button>
                               </div>
                             </div>
                           ) : (
@@ -871,6 +1076,12 @@ export function TextAnnotationWorkbench() {
                                     <b>{annotation.source}</b>
                                   </div>
                                   <p className="mt-1 text-stone-700">{annotation.body}</p>
+                                  {annotation.migrationNote ? (
+                                    <p className="mt-1 flex items-start gap-1 text-[11px] leading-4 text-amber-800">
+                                      <ArrowRightLeft className="mt-0.5 h-3 w-3 shrink-0" />
+                                      {annotation.migrationNote}
+                                    </p>
+                                  ) : null}
                                 </div>
                               )) : <p className="text-xs text-stone-500">本句尚无来源异文或校记。</p>}
                             </div>
@@ -895,20 +1106,46 @@ export function TextAnnotationWorkbench() {
                           ) : null}
                         </div>
                         {mode === 'editing' ? (
-                          <Tooltip content="编辑正文，词级引用会自动迁移">
-                            <Button
-                              isIconOnly
-                              size="sm"
-                              variant="light"
-                              aria-label="编辑句子"
-                              onPress={() => {
-                                setEditingSentenceId(sentence.id);
-                                setEditingSentenceDraft(sentence.text);
-                              }}
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </Button>
-                          </Tooltip>
+                          <div className="flex shrink-0 flex-col gap-1">
+                            <Tooltip content="编辑正文，丢失词级引用会迁移到所属句">
+                              <Button
+                                isIconOnly
+                                size="sm"
+                                variant="light"
+                                aria-label="编辑句子"
+                                onPress={() => {
+                                  setSplittingSentenceId(null);
+                                  setEditingSentenceId(sentence.id);
+                                  setEditingSentenceDraft(sentence.text);
+                                }}
+                              >
+                                <Pencil className="h-4 w-4" />
+                              </Button>
+                            </Tooltip>
+                            <Tooltip content="按光标位置拆为两句；句注留前句，后半段词注跟后句">
+                              <Button
+                                isIconOnly
+                                size="sm"
+                                variant="light"
+                                aria-label="拆分句子"
+                                onPress={() => startSplitSentence(sentence)}
+                              >
+                                <Scissors className="h-4 w-4" />
+                              </Button>
+                            </Tooltip>
+                            <Tooltip content={isLastSentence ? '本章最后一句，无下一句可合并' : '与下一句合并；词注指向原词，句注迁入新句并注明来源'}>
+                              <Button
+                                isIconOnly
+                                size="sm"
+                                variant="light"
+                                aria-label="与下一句合并"
+                                isDisabled={isLastSentence}
+                                onPress={() => mergeWithNextSentence(sentence)}
+                              >
+                                <Combine className="h-4 w-4" />
+                              </Button>
+                            </Tooltip>
+                          </div>
                         ) : null}
                       </div>
                     </article>

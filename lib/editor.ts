@@ -1,11 +1,14 @@
 import type {
+  AnchorType,
   Annotation,
   AnnotationKind,
+  Chapter,
   ConflictGroup,
   EditorState,
   SearchResult,
   Sentence,
   TextDocument,
+  TextToken,
   WorkspaceState
 } from './types';
 
@@ -137,23 +140,177 @@ export function getSentence(document: TextDocument, sentenceId: string): Sentenc
 }
 
 export function getTargetLabel(document: TextDocument, annotation: Annotation): string {
-  if (annotation.anchorType === 'chapter') {
-    return document.chapters.find((chapter) => chapter.id === annotation.anchorId)?.title ?? '未知章节';
-  }
+  const label = getAnchorLabelFromChapters(document.chapters, annotation.anchorId, annotation.anchorType);
+  return label ?? (annotation.migrationNote ? annotation.migrationNote : '引用目标已迁移到所属句');
+}
 
-  for (const chapter of document.chapters) {
-    if (annotation.anchorType === 'sentence') {
-      const sentence = chapter.sentences.find((item) => item.id === annotation.anchorId);
+/** 在指定章节集合中解析锚点的展示名（版本比较时可传入快照中的章节）。 */
+export function getAnchorLabelFromChapters(
+  chapters: Chapter[],
+  anchorId: string,
+  anchorType: AnchorType
+): string | undefined {
+  if (anchorType === 'chapter') {
+    return chapters.find((chapter) => chapter.id === anchorId)?.title;
+  }
+  for (const chapter of chapters) {
+    if (anchorType === 'sentence') {
+      const sentence = chapter.sentences.find((item) => item.id === anchorId);
       if (sentence) return `${chapter.title} · 第 ${sentence.order} 句`;
     } else {
       for (const sentence of chapter.sentences) {
-        const token = sentence.tokens.find((item) => item.id === annotation.anchorId);
+        const token = sentence.tokens.find((item) => item.id === anchorId);
         if (token) return `${chapter.title} · “${token.text.trim()}”`;
       }
     }
   }
+  return undefined;
+}
 
-  return '引用目标已迁移到所属句';
+export interface SentenceStructureResult {
+  frontId: string;
+  backId: string;
+  frontWordNotes: number;
+  backWordNotes: number;
+  sentenceNotes: number;
+}
+
+interface TokenSpan extends TextToken {
+  start: number;
+  end: number;
+}
+
+function tokenSpans(sentence: Sentence): TokenSpan[] {
+  const spans: TokenSpan[] = [];
+  let offset = 0;
+  for (const token of sentence.tokens) {
+    // 分词结果与原文严格连续；为稳妥起见，缺失片段用 indexOf 定位。
+    const index = sentence.text.indexOf(token.text, offset);
+    const start = index >= 0 ? index : offset;
+    const end = start + token.text.length;
+    spans.push({ ...token, start, end });
+    offset = end;
+  }
+  return spans;
+}
+
+function renumberChapter(chapter: Chapter) {
+  chapter.sentences.forEach((sentence, index) => {
+    sentence.order = index + 1;
+  });
+}
+
+/**
+ * 按光标位置把一句拆成两句：
+ * - 前句保留原句 id（即“含原句起点的前句”），句注因此自动留在前句；
+ * - 完全落在后半段的词注随原词（token id 不变）跟到后句；
+ * - 横跨切分点的词在原词 id 上保留前半段，词注跟前句；后半段是新 token。
+ */
+export function splitSentenceAt(
+  document: TextDocument,
+  sentenceId: string,
+  offset: number,
+  newSentenceId: string,
+  newTokenId: (sentenceId: string, hint?: number) => string
+): SentenceStructureResult | null {
+  for (const chapter of document.chapters) {
+    const index = chapter.sentences.findIndex((item) => item.id === sentenceId);
+    if (index < 0) continue;
+    const original = chapter.sentences[index];
+    if (!Number.isInteger(offset) || offset <= 0 || offset >= original.text.length) return null;
+
+    const spans = tokenSpans(original);
+    const frontTokens: TextToken[] = [];
+    const backTokens: TextToken[] = [];
+    const backTokenIds = new Set<string>();
+    let hint = 0;
+
+    for (const span of spans) {
+      if (span.end <= offset) {
+        frontTokens.push({ id: span.id, text: span.text });
+      } else if (span.start >= offset) {
+        backTokens.push({ id: span.id, text: span.text });
+        backTokenIds.add(span.id);
+      } else {
+        // 横跨光标：前半段沿用原 token id，词注跟前句。
+        frontTokens.push({ id: span.id, text: span.text.slice(0, offset - span.start) });
+        const tail = span.text.slice(offset - span.start);
+        if (tail) {
+          const tailToken = { id: newTokenId(newSentenceId, hint++), text: tail };
+          backTokens.push(tailToken);
+        }
+      }
+    }
+
+    const frontText = original.text.slice(0, offset);
+    const backText = original.text.slice(offset);
+    const front: Sentence = { id: original.id, order: original.order, text: frontText, tokens: frontTokens };
+    const back: Sentence = { id: newSentenceId, order: original.order + 1, text: backText, tokens: backTokens };
+    chapter.sentences.splice(index, 1, front, back);
+    renumberChapter(chapter);
+
+    let frontWordNotes = 0;
+    let backWordNotes = 0;
+    let sentenceNotes = 0;
+    for (const annotation of document.annotations) {
+      if (annotation.anchorType === 'sentence' && annotation.anchorId === original.id) sentenceNotes += 1;
+      if (annotation.anchorType === 'word') {
+        if (backTokenIds.has(annotation.anchorId)) backWordNotes += 1;
+        else if (frontTokens.some((token) => token.id === annotation.anchorId)) frontWordNotes += 1;
+      }
+    }
+    return { frontId: front.id, backId: back.id, frontWordNotes, backWordNotes, sentenceNotes };
+  }
+  return null;
+}
+
+export interface MergeSentencesResult {
+  mergedId: string;
+  migratedSentenceNotes: number;
+}
+
+/**
+ * 把相邻两句合成一句：词注仍指向原词（两个句子的 token 原样保留），
+ * 两句的句注全部迁到新句，并在 migrationNote 注明来自哪句。
+ */
+export function mergeSentences(
+  document: TextDocument,
+  chapterId: string,
+  firstSentenceId: string,
+  newSentenceId: string
+): MergeSentencesResult | null {
+  const chapter = document.chapters.find((item) => item.id === chapterId);
+  if (!chapter) return null;
+  const index = chapter.sentences.findIndex((item) => item.id === firstSentenceId);
+  if (index < 0 || index + 1 >= chapter.sentences.length) return null;
+
+  const first = chapter.sentences[index];
+  const second = chapter.sentences[index + 1];
+  const merged: Sentence = {
+    id: newSentenceId,
+    order: first.order,
+    text: `${first.text}${second.text}`,
+    tokens: [...first.tokens, ...second.tokens]
+  };
+
+  const stamp = new Date().toLocaleString('zh-CN');
+  let migratedSentenceNotes = 0;
+  for (const annotation of document.annotations) {
+    if (annotation.anchorType !== 'sentence') continue;
+    if (annotation.anchorId === first.id) {
+      annotation.anchorId = merged.id;
+      annotation.migrationNote = `合句迁入：来自原第 ${first.order} 句「${first.text.slice(0, 12)}」（${stamp}）`;
+      migratedSentenceNotes += 1;
+    } else if (annotation.anchorId === second.id) {
+      annotation.anchorId = merged.id;
+      annotation.migrationNote = `合句迁入：来自原第 ${second.order} 句「${second.text.slice(0, 12)}」（${stamp}）`;
+      migratedSentenceNotes += 1;
+    }
+  }
+
+  chapter.sentences.splice(index, 2, merged);
+  renumberChapter(chapter);
+  return { mergedId: merged.id, migratedSentenceNotes };
 }
 
 export function collectSearchResults(document: TextDocument, query: string): SearchResult[] {

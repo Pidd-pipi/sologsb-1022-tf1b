@@ -12,6 +12,16 @@ import type {
 const FIXED_TIME = '2026-09-25T02:00:00.000Z';
 let tokenSequence = 0;
 
+export function newTokenId(sentenceId: string, hint = 0) {
+  tokenSequence += 1;
+  const nonce = Math.random().toString(36).slice(2, 7);
+  return `${sentenceId}-token-${hint}-${tokenSequence.toString(36)}-${nonce}`;
+}
+
+export function newSentenceId() {
+  return `sentence-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
 function canUseSegmenter() {
   return typeof Intl !== 'undefined' && 'Segmenter' in Intl;
 }
@@ -40,7 +50,7 @@ export function tokenizeText(text: string, sentenceId: string, existing: TextTok
     }
     tokenSequence += 1;
     return {
-      id: `${sentenceId}-token-${index}-${tokenSequence.toString(36)}`,
+      id: newTokenId(sentenceId, index),
       text: part
     };
   });

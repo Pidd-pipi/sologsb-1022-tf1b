@@ -36,6 +36,8 @@ export interface Annotation {
   tags: string[];
   conflictState: 'open' | 'resolved';
   conflictResolution?: string;
+  /** 句子拆分/合并时迁移到新目标的出处说明，例如“合句自原第 4 句：……” */
+  migrationNote?: string;
   updatedAt: string;
 }
 
