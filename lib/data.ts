@@ -30,7 +30,7 @@ export function tokenizeText(text: string, sentenceId: string, existing: TextTok
   }
 
   const used = new Set<number>();
-  return parts.map((part, index) => {
+  const tokens = parts.map((part, index) => {
     const matchedIndex = existing.findIndex(
       (token, tokenIndex) => !used.has(tokenIndex) && token.text === part
     );
@@ -44,6 +44,16 @@ export function tokenizeText(text: string, sentenceId: string, existing: TextTok
       text: part
     };
   });
+
+  // 复用结果拼接必须能还原原文；否则放弃复用，全部重新生成，避免丢字
+  if (tokens.map((token) => token.text).join('') !== text) {
+    tokenSequence += parts.length;
+    return parts.map((part, index) => ({
+      id: `${sentenceId}-token-${index}-${tokenSequence.toString(36)}`,
+      text: part
+    }));
+  }
+  return tokens;
 }
 
 function sentence(id: string, order: number, text: string): Sentence {
@@ -99,7 +109,15 @@ function tokenId(chapter: number, sentenceIndex: number, index: number) {
 
 function findTokenId(sentenceId: string, text: string) {
   const target = chapters.flatMap((chapter) => chapter.sentences).find((item) => item.id === sentenceId);
-  return target?.tokens.find((token) => token.text.includes(text))?.id ?? target?.id ?? sentenceId;
+  if (!target) return sentenceId;
+  // 优先整体包含；分词把多字词拆开时，退回首字所在 token，避免词注悬空到句 ID
+  const contained = target.tokens.find((token) => token.text.includes(text));
+  if (contained) return contained.id;
+  for (const char of text) {
+    const single = target.tokens.find((token) => token.text === char);
+    if (single) return single.id;
+  }
+  return target.id;
 }
 
 const pengId = findTokenId('sentence-1-3', '鹏');
